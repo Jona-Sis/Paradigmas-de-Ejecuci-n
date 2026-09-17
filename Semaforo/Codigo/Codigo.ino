@@ -1,180 +1,137 @@
 /*
-  Práctica: Semáforo Vehicular y Peatonal con Máquina de Estados Finitos
-  Arduino UNO R4 WiFi
-
-  - Sin delay() en ningún punto: toda la temporización usa millis().
-  - Estados modelados con enum class (tipado fuerte, sin fugas al espacio global).
+  Práctica 3: Semáforo Vehicular y Peatonal (FSM)
+  Mapeo de Pines:
+  - Vehicular: Rojo (Pin 8), Amarillo (Pin 9), Verde (Pin 10)
+  - Peatonal:  Rojo (Pin 6), Verde (Pin 7)
+  - Botón:     Pin 2 (Usa INPUT_PULLUP interno)
 */
 
-// ---------- Pines ----------
-const uint8_t PIN_VEH_ROJO     = 2;
-const uint8_t PIN_VEH_AMARILLO = 3;
-const uint8_t PIN_VEH_VERDE    = 4;
-const uint8_t PIN_PEA_ROJO     = 5;
-const uint8_t PIN_PEA_VERDE    = 6;
-const uint8_t PIN_BOTON        = 7;
+// Asignación de Pines
+const uint8_t LED_VEH_ROJO     = 8;
+const uint8_t LED_VEH_AMARILLO = 9;
+const uint8_t LED_VEH_VERDE    = 10;
 
-// ---------- Duraciones (ms) ----------
-const unsigned long T_VEH_VERDE     = 8000;  // vehicular en verde
-const unsigned long T_VEH_AMARILLO  = 2000;  // más corto que verde/rojo
-const unsigned long T_VEH_ROJO      = 6000;  // vehicular en rojo (sin solicitud peatonal)
-const unsigned long T_PEA_VERDE     = 5000;  // peatonal en verde
-const unsigned long T_DEBOUNCE      = 50;    // antirrebote del botón
+const uint8_t LED_PEAT_ROJO    = 6;
+const uint8_t LED_PEAT_VERDE   = 7;
 
-// ---------- Estados de la FSM ----------
+const uint8_t BOTON_PEATON     = 2;
+
+// Definición de la Máquina de Estados Finita
 enum class EstadoSemaforo {
-  VEH_VERDE,
-  VEH_AMARILLO,
-  VEH_ROJO,
-  PEA_VERDE
+  VERDE_VEHICULO,
+  AMARILLO_VEHICULO,
+  VERDE_PEATON,
+  PARPADEO_PEATON
 };
 
-// ---------- Variables de estado global ----------
-EstadoSemaforo estadoActual = EstadoSemaforo::VEH_VERDE;
-unsigned long inicioEstado = 0;          // millis() en que se entró al estado actual
-bool solicitudPeatonal = false;          // flag "armado" por el botón
+EstadoSemaforo estadoActual = EstadoSemaforo::VERDE_VEHICULO;
 
-// ---------- Antirrebote del botón ----------
-// Se separan dos roles que antes estaban mezclados en una sola variable:
-// - ultimaLecturaCruda: la última lectura física del pin, usada solo para
-//   detectar cambios y reiniciar el temporizador de rebote.
-// - estadoEstable: el último valor ya confirmado (estable durante T_DEBOUNCE),
-//   usado para detectar el flanco de bajada real.
-int ultimaLecturaCruda = HIGH;           // con INPUT_PULLUP, HIGH = suelto
-int estadoEstable = HIGH;
-unsigned long ultimoCambioLectura = 0;
+// Intervalos de tiempo (milisegundos)
+const unsigned long TIEMPO_VERDE_VEH   = 5000;
+const unsigned long TIEMPO_AMARILLO    = 2000;
+const unsigned long TIEMPO_VERDE_PEAT  = 4000;
+const unsigned long TIEMPO_PARPADEO    = 2000;
+const unsigned long INTERVALO_PARPADEO = 250;
 
-// =====================================================================
-// Apaga todos los LEDs y enciende solo los que corresponden al estado
-// =====================================================================
-void aplicarSalidasEstado(EstadoSemaforo estado) {
-  digitalWrite(PIN_VEH_ROJO, LOW);
-  digitalWrite(PIN_VEH_AMARILLO, LOW);
-  digitalWrite(PIN_VEH_VERDE, LOW);
-  digitalWrite(PIN_PEA_ROJO, LOW);
-  digitalWrite(PIN_PEA_VERDE, LOW);
+// Variables de temporización y banderas
+unsigned long tiempoInicioEstado = 0;
+unsigned long ultimoParpadeo = 0;
+bool solicitudPeaton = false;
 
-  switch (estado) {
-    case EstadoSemaforo::VEH_VERDE:
-      digitalWrite(PIN_VEH_VERDE, HIGH);
-      digitalWrite(PIN_PEA_ROJO, HIGH);
-      break;
+// Variables para el filtro anti-rebote (Debounce)
+unsigned long ultimoDebounce = 0;
+const unsigned long TIEMPO_DEBOUNCE = 50;
+bool ultimoEstadoBoton = HIGH;
 
-    case EstadoSemaforo::VEH_AMARILLO:
-      digitalWrite(PIN_VEH_AMARILLO, HIGH);
-      digitalWrite(PIN_PEA_ROJO, HIGH);
-      break;
-
-    case EstadoSemaforo::VEH_ROJO:
-      digitalWrite(PIN_VEH_ROJO, HIGH);
-      digitalWrite(PIN_PEA_ROJO, HIGH);
-      break;
-
-    case EstadoSemaforo::PEA_VERDE:
-      digitalWrite(PIN_VEH_ROJO, HIGH);   // el vehicular se mantiene en rojo
-      digitalWrite(PIN_PEA_VERDE, HIGH);
-      break;
-  }
-}
-
-// =====================================================================
-// Transición: cambia de estado, marca el tiempo de entrada y aplica
-// las salidas correspondientes (acción de entrada del estado)
-// =====================================================================
-void cambiarEstado(EstadoSemaforo nuevoEstado) {
-  estadoActual = nuevoEstado;
-  inicioEstado = millis();
-  aplicarSalidasEstado(nuevoEstado);
-}
-
-// =====================================================================
-// Lee el botón con antirrebote. Devuelve true una sola vez, en el
-// instante justo en que se detecta una pulsación válida (flanco de bajada).
-// =====================================================================
-bool botonPresionado() {
-  int lectura = digitalRead(PIN_BOTON);
-  bool presionDetectada = false;
-
-  if (lectura != ultimaLecturaCruda) {
-    ultimoCambioLectura = millis();
-  }
-
-  if ((millis() - ultimoCambioLectura) > T_DEBOUNCE) {
-    // La lectura lleva estable más de T_DEBOUNCE: si cambió respecto
-    // al último estado confirmado, es un cambio real (no rebote).
-    if (lectura != estadoEstable) {
-      estadoEstable = lectura;
-      if (estadoEstable == LOW) {
-        presionDetectada = true;
-      }
-    }
-  }
-
-  ultimaLecturaCruda = lectura;
-  return presionDetectada;
-}
-
-// =====================================================================
-// setup()
-// =====================================================================
 void setup() {
-  pinMode(PIN_VEH_ROJO, OUTPUT);
-  pinMode(PIN_VEH_AMARILLO, OUTPUT);
-  pinMode(PIN_VEH_VERDE, OUTPUT);
-  pinMode(PIN_PEA_ROJO, OUTPUT);
-  pinMode(PIN_PEA_VERDE, OUTPUT);
-  pinMode(PIN_BOTON, INPUT_PULLUP);
-
-  cambiarEstado(EstadoSemaforo::VEH_VERDE);
+  pinMode(LED_VEH_ROJO, OUTPUT);
+  pinMode(LED_VEH_AMARILLO, OUTPUT);
+  pinMode(LED_VEH_VERDE, OUTPUT);
+  
+  pinMode(LED_PEAT_ROJO, OUTPUT);
+  pinMode(LED_PEAT_VERDE, OUTPUT);
+  
+  pinMode(BOTON_PEATON, INPUT_PULLUP);
+  
+  Serial.begin(115200);
+  Serial.println("--- Sistema FSM Iniciado ---");
+  
+  tiempoInicioEstado = millis();
 }
 
-// =====================================================================
-// loop()
-// =====================================================================
 void loop() {
   unsigned long ahora = millis();
-  unsigned long transcurrido = ahora - inicioEstado;
-
-  // --- Lectura del botón: solo "arma" la solicitud si el vehicular
-  //     está en VERDE o AMARILLO (requisito 3) ---
-  if (botonPresionado()) {
-    if (estadoActual == EstadoSemaforo::VEH_VERDE ||
-        estadoActual == EstadoSemaforo::VEH_AMARILLO) {
-      solicitudPeatonal = true;
-    }
-    // Si se presiona en otro estado, simplemente se ignora.
+  
+  // 1. Lectura del botón con Debounce
+  bool lecturaBoton = digitalRead(BOTON_PEATON);
+  if (lecturaBoton != ultimoEstadoBoton) {
+    ultimoDebounce = ahora;
   }
+  if ((ahora - ultimoDebounce) > TIEMPO_DEBOUNCE) {
+    if (lecturaBoton == LOW) {
+      if (!solicitudPeaton) {
+        solicitudPeaton = true;
+        Serial.println("-> Solicitud peatonal registrada.");
+      }
+    }
+  }
+  ultimoEstadoBoton = lecturaBoton;
 
-  // --- Lógica de transición de la FSM ---
+  // 2. Control de Estados (FSM)
   switch (estadoActual) {
-
-    case EstadoSemaforo::VEH_VERDE:
-      if (transcurrido >= T_VEH_VERDE) {
-        cambiarEstado(EstadoSemaforo::VEH_AMARILLO);
+    
+    case EstadoSemaforo::VERDE_VEHICULO:
+      digitalWrite(LED_VEH_ROJO, LOW);
+      digitalWrite(LED_VEH_AMARILLO, LOW);
+      digitalWrite(LED_VEH_VERDE, HIGH);
+      
+      digitalWrite(LED_PEAT_ROJO, HIGH);
+      digitalWrite(LED_PEAT_VERDE, LOW);
+      
+      if ((ahora - tiempoInicioEstado >= TIEMPO_VERDE_VEH) && solicitudPeaton) {
+        estadoActual = EstadoSemaforo::AMARILLO_VEHICULO;
+        tiempoInicioEstado = ahora;
+        Serial.println("Estado: Amarillo Vehicular");
       }
       break;
 
-    case EstadoSemaforo::VEH_AMARILLO:
-      if (transcurrido >= T_VEH_AMARILLO) {
-        cambiarEstado(EstadoSemaforo::VEH_ROJO);
+    case EstadoSemaforo::AMARILLO_VEHICULO:
+      digitalWrite(LED_VEH_VERDE, LOW);
+      digitalWrite(LED_VEH_AMARILLO, HIGH);
+      
+      if (ahora - tiempoInicioEstado >= TIEMPO_AMARILLO) {
+        estadoActual = EstadoSemaforo::VERDE_PEATON;
+        tiempoInicioEstado = ahora;
+        solicitudPeaton = false;
+        Serial.println("Estado: Verde Peatonal");
       }
       break;
 
-    case EstadoSemaforo::VEH_ROJO:
-      if (solicitudPeatonal) {
-        // Hay solicitud pendiente: en cuanto el vehicular llega a rojo,
-        // se atiende de inmediato (requisito 4).
-        solicitudPeatonal = false;
-        cambiarEstado(EstadoSemaforo::PEA_VERDE);
-      } else if (transcurrido >= T_VEH_ROJO) {
-        // Nadie pidió cruzar: el ciclo sigue solo (requisito 5).
-        cambiarEstado(EstadoSemaforo::VEH_VERDE);
+    case EstadoSemaforo::VERDE_PEATON:
+      digitalWrite(LED_VEH_AMARILLO, LOW);
+      digitalWrite(LED_VEH_ROJO, HIGH);
+      
+      digitalWrite(LED_PEAT_ROJO, LOW);
+      digitalWrite(LED_PEAT_VERDE, HIGH);
+      
+      if (ahora - tiempoInicioEstado >= TIEMPO_VERDE_PEAT) {
+        estadoActual = EstadoSemaforo::PARPADEO_PEATON;
+        tiempoInicioEstado = ahora;
+        ultimoParpadeo = ahora;
+        Serial.println("Estado: Parpadeo Peatonal");
       }
       break;
 
-    case EstadoSemaforo::PEA_VERDE:
-      if (transcurrido >= T_PEA_VERDE) {
-        cambiarEstado(EstadoSemaforo::VEH_VERDE);
+    case EstadoSemaforo::PARPADEO_PEATON:
+      if (ahora - ultimoParpadeo >= INTERVALO_PARPADEO) {
+        ultimoParpadeo = ahora;
+        digitalWrite(LED_PEAT_VERDE, !digitalRead(LED_PEAT_VERDE));
+      }
+      
+      if (ahora - tiempoInicioEstado >= TIEMPO_PARPADEO) {
+        estadoActual = EstadoSemaforo::VERDE_VEHICULO;
+        tiempoInicioEstado = ahora;
+        Serial.println("Estado: Verde Vehicular");
       }
       break;
   }
